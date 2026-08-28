@@ -1,0 +1,86 @@
+From 32120b991b3fc774bb87b9bd1bdfae8ce77be47c Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Fri, 28 Aug 2026 21:39:53 +0800
+Subject: [PATCH] linux-cp: process netlink batches under worker barrier
+
+Linux-cp route callbacks update worker-visible FIB state despite being
+marked mp-safe. A worker can therefore access an IPv6 exact-match hash
+while a netlink route update resizes it.
+
+Apply queued notifications under one barrier per configured batch. For
+dump replies, receive the netlink buffer before stopping workers and
+protect only its parsing. This also covers automatic resync without
+holding the barrier across socket I/O.
+
+Signed-off-by: Canoziia <canoziia@projectk.org>
+---
+ src/plugins/linux-cp/lcp_nl.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/plugins/linux-cp/lcp_nl.c b/src/plugins/linux-cp/lcp_nl.c
+index 9c08ac299..4cd6e9387 100644
+--- a/src/plugins/linux-cp/lcp_nl.c
++++ b/src/plugins/linux-cp/lcp_nl.c
+@@ -350,9 +350,11 @@ nl_route_process_msgs (void)
+ {
+   nl_main_t *nm = &nl_main;
+   nl_msg_info_t *msg_info;
++  vlib_main_t *vm = vlib_get_main ();
+   int err, n_msgs = 0;
+ 
+   lcp_set_netlink_processing_active (1);
++  vlib_worker_thread_barrier_sync (vm);
+ 
+   /* process a batch of messages. break if we hit our limit */
+   vec_foreach (msg_info, nm->nl_msg_queue)
+@@ -365,6 +367,8 @@ nl_route_process_msgs (void)
+ 	break;
+     }
+ 
++  vlib_worker_thread_barrier_release (vm);
++
+   /* remove the messages we processed from the head of the queue */
+   if (n_msgs)
+     vec_delete (nm->nl_msg_queue, n_msgs, 0);
+@@ -440,6 +444,7 @@ lcp_nl_recv_dump_replies (nl_sock_type_t sock_type, int msg_limit,
+ {
+   nl_main_t *nm = &nl_main;
+   struct nl_sock *sk_route = nm->sk_route_sync[sock_type];
++  vlib_main_t *vm = vlib_get_main ();
+   struct sockaddr_nl nla;
+   uint8_t *buf = NULL;
+   int n_bytes;
+@@ -459,6 +464,8 @@ continue_reading:
+       return n_bytes;
+     }
+ 
++  vlib_worker_thread_barrier_sync (vm);
++
+   hdr = (struct nlmsghdr *) buf;
+   while (nlmsg_ok (hdr, n_bytes))
+     {
+@@ -525,6 +532,8 @@ continue_reading:
+       hdr = nlmsg_next (hdr, &n_bytes);
+     }
+ 
++  vlib_worker_thread_barrier_release (vm);
++
+   nlmsg_free (msg);
+   free (buf);
+   msg = NULL;
+@@ -533,7 +542,12 @@ continue_reading:
+   if (!done && n_msgs < msg_limit)
+     goto continue_reading;
+ 
++  goto done;
++
+ out:
++  vlib_worker_thread_barrier_release (vm);
++
++done:
+   lcp_set_netlink_processing_active (0);
+ 
+   nlmsg_free (msg);
+-- 
+2.55.0
+
